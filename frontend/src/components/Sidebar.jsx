@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { FiPlus, FiMessageSquare } from 'react-icons/fi';
 import { listarConversaciones, crearConversacion } from '../api/conversaciones.api';
 import ConversationItem from './ConversationItem';
 
@@ -10,7 +11,6 @@ export default function Sidebar({ currentConvId }) {
 
   useEffect(() => {
     load();
-    // simple polling to keep list in sync
     const id = setInterval(load, 8000);
     return () => clearInterval(id);
   }, []);
@@ -40,8 +40,13 @@ export default function Sidebar({ currentConvId }) {
   return (
     <div className="sidebar">
       <div className="sidebar-header">
-        <h3>Conversaciones</h3>
-        <button onClick={handleNew} className="new-btn">➕</button>
+        <h3>
+          <FiMessageSquare size={18} style={{ verticalAlign: 'middle', marginRight: '0.5rem' }} />
+          Conversaciones
+        </h3>
+        <button onClick={handleNew} className="new-btn" title="Nueva conversación">
+          <FiPlus size={18} />
+        </button>
       </div>
       <div className="sidebar-list">
         {loading && <div className="loading">Cargando...</div>}

@@ -1,7 +1,8 @@
+import React from 'react';
 import MarkdownIt from 'markdown-it';
-import hljs from 'highlight.js';
-import 'highlight.js/styles/github.css';
 import CodeBlock from './CodeBlock';
+import { FiUser, FiCpu } from 'react-icons/fi';
+import 'highlight.js/styles/github-dark.css';
 
 const md = new MarkdownIt({
   html: false,
@@ -9,39 +10,51 @@ const md = new MarkdownIt({
   typographer: true
 });
 
-// Split text into segments: markdown text and fenced code blocks
+/**
+ * Separa un texto en segmentos de Markdown y bloques de código.
+ * Robusto ante backticks internos dentro de los bloques de código.
+ */
 const splitIntoSegments = (text = '') => {
   const segments = [];
-  const regex = /```(\w+)?\n([\s\S]*?)```/g;
+  const regex = /^```(\w+)?\n([\s\S]*?)^```$/gm; // busca solo ``` al inicio de línea
   let lastIndex = 0;
   let match;
+
   while ((match = regex.exec(text)) !== null) {
     const idx = match.index;
     if (idx > lastIndex) {
       segments.push({ type: 'md', content: text.slice(lastIndex, idx) });
     }
+    // **No reemplazamos nada antes**, el contenido queda crudo
     segments.push({ type: 'code', lang: match[1] || '', content: match[2] });
     lastIndex = regex.lastIndex;
   }
+
   if (lastIndex < text.length) {
     segments.push({ type: 'md', content: text.slice(lastIndex) });
   }
+
   return segments;
 };
+
 
 export default function MessageBubble({ message }) {
   const isUser = message.rol === 'user' || message.rol === 'usuario';
   const isStreaming = message.streaming;
 
-  const segments = splitIntoSegments(message.contenido || '');
+  // No reemplazamos \n globalmente antes del split, solo lo hacemos en cada segmento
+  const rawContent = message.contenido || '';
+  const segments = splitIntoSegments(rawContent);
 
   return (
     <div className={`message-bubble ${isUser ? 'user' : 'assistant'} ${isStreaming ? 'streaming' : ''}`}>
       <div className="message-header">
-        <strong>{isUser ? '👤 Tú' : '🤖 Asistente'}</strong>
+        <strong>
+          {isUser ? <><FiUser size={16} /> Tú</> : <><FiCpu size={16} /> Asistente</>}
+        </strong>
         {message.marcaDeTiempo && (
           <span className="timestamp">
-            {new Date(message.marcaDeTiempo).toLocaleTimeString()}
+            {new Date(message.marcaDeTiempo).toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' })}
           </span>
         )}
       </div>
@@ -55,8 +68,9 @@ export default function MessageBubble({ message }) {
               </div>
             );
           } else {
-            // render markdown part
-            const html = md.render(seg.content || '');
+            // Reemplazamos \n literales en el Markdown
+           const html = md.render(seg.content.replace(/\\n/g, '\n'));
+
             return <div key={i} dangerouslySetInnerHTML={{ __html: html }} />;
           }
         })}
