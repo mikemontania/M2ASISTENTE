@@ -1,0 +1,126 @@
+/* Sidebar layout and styles */
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 16px;
+  gap: 12px;
+  background: #fff;
+}
+
+/* Header */
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #eef2f6;
+}
+.sidebar-header h2,
+.sidebar-header h3 {
+  margin: 0;
+  font-size: 16px;
+  color: #0f172a;
+}
+.new-chat-btn,
+.new-btn {
+  background: linear-gradient(135deg,#667eea,#764ba2);
+  color: #fff;
+  border: none;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+  box-shadow: 0 4px 10px rgba(102,126,234,0.12);
+}
+.new-chat-btn:hover,
+.new-btn:hover { transform: translateY(-1px); }
+
+/* Search / filter area (optional) */
+.sidebar-search {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding-top: 8px;
+}
+.sidebar-search input {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #e6e9ef;
+  font-size: 14px;
+}
+
+/* Conversations list area */
+.sidebar-list,
+.conversations-list {
+  overflow-y: auto;
+  padding-top: 8px;
+}
+
+/* Conversation item */
+.conversation-item,
+.conversation-item:hover,
+.conversation-item:focus {
+  display: block;
+  padding: 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.12s ease, transform 0.08s ease;
+  color: #0b1220;
+}
+.conversation-item:hover { background: #f6f8ff; transform: translateY(-1px); }
+.conversation-item.active { background: #eef2ff; border-left: 3px solid #667eea; padding-left: 8px; }
+
+.conv-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: #0b1220;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.conv-preview {
+  font-size: 13px;
+  color: #6b7280;
+  line-height: 1.2;
+  max-height: 2.4em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Loading / empty states */
+.loading,
+.empty {
+  padding: 16px;
+  color: #6b7280;
+  text-align: center;
+  font-size: 14px;
+}
+
+/* Footer actions (optional) */
+.sidebar-footer {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid #eef2f6;
+  display: flex;
+  gap: 8px;
+}
+
+/* Responsive adjustments */
+@media (max-width: 900px) {
+  .app-grid { grid-template-columns: 1fr; }
+  .left-col { display: none; } /* hide sidebar on small screens, you can toggle via button */
+}
+
+/* Small helpers */
+.small-muted { font-size: 12px; color: #9aa3b2; }
+.btn-ghost {
+  background: transparent;
+  border: 1px solid #e6e9ef;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
