@@ -1,8 +1,22 @@
-// reemplaza tu ia.service.js por este: logs controlados por DEBUG_CHAT y emisión debug_model_payload
+// services/ia.service.js
+// Llamadas a Ollama con override de modelo, semáforo de concurrencia, y debug emitido por socket.
 const socketService = require('./socket.service');
+const fetch = global.fetch || require('node-fetch'); // si Node >=18 no hace falta
 
 const ollamaUrl = process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
-const model = process.env.OLLAMA_MODEL || 'llama3.2';
+const defaultModel = process.env.OLLAMA_MODEL || 'qwen2.5:7b';
+
+// Control simple de concurrencia para no saturar CPU
+const MAX_CONCURRENT_MODEL_CALLS = parseInt(process.env.MAX_MODEL_CONCURRENCY || '1', 10);
+let currentCalls = 0;
+const waitForFreeSlot = () => new Promise((resolve) => {
+  const iv = setInterval(() => {
+    if (currentCalls < MAX_CONCURRENT_MODEL_CALLS) {
+      clearInterval(iv);
+      resolve();
+    }
+  }, 100);
+});
 
 const mapRole = (r) => {
   if (!r) return 'user';
@@ -18,42 +32,40 @@ const safeTruncate = (s, n = 1000) => {
   return s.slice(0, n) + `\n\n...[TRUNCADO ${s.length - n} chars]...`;
 };
 
-const chatWithOllama = async ({ mensajes, stream = false, socketId = null, timeoutMs = 180000 }) => {
+/**
+ * chatWithOllama
+ * @param {Object} opts
+ *  - mensajes: [{rol, contenido}, ...]
+ *  - stream: boolean
+ *  - socketId: string (opcional) para emitir via socket
+ *  - timeoutMs: number
+ *  - model: string (override, e.g. 'qwen2.5-coder:7b')
+ * @returns { content, raw, model }
+ */
+const chatWithOllama = async ({ mensajes = [], stream = false, socketId = null, timeoutMs = 180000, model = null }) => {
+  await waitForFreeSlot();
+  currentCalls++;
+
   const url = `${ollamaUrl}/api/chat`;
+  const usedModel = model || defaultModel;
 
-  const messages = mensajes.map(m => ({
-    role: mapRole(m.rol),
-    content: m.contenido
-  }));
+  const messages = mensajes.map(m => ({ role: mapRole(m.rol), content: m.contenido }));
+  const body = { model: usedModel, messages, stream };
 
-  const body = { model, messages, stream };
-
-  // DEBUG: mostrar y emitir lo que enviaremos exactamente a Ollama
   if (process.env.DEBUG_CHAT === 'true') {
     try {
       console.log('[DEBUG][ia.service] Enviando a Ollama:', {
-        url,
-        model,
-        stream,
-        totalMessages: messages.length,
-        messagesPreview: messages.slice(0, 10).map(m => ({ role: m.role, content: safeTruncate(m.content, 500) }))
+        url, usedModel, stream, totalMessages: messages.length,
+        messagesPreview: messages.slice(0, 8).map(m => ({ role: m.role, content: safeTruncate(m.content, 500) }))
       });
+      if (socketId) {
+        socketService.emitToSocket(socketId, 'debug_model_payload', {
+          url, usedModel, stream, totalMessages: messages.length,
+          messagesPreview: messages.slice(0, 6).map(m => ({ role: m.role, content: safeTruncate(m.content, 500) }))
+        });
+      }
     } catch (e) {
-      console.warn('[DEBUG] log falló:', e.message);
-    }
-  }
-
-  if (socketId && process.env.DEBUG_CHAT === 'true') {
-    try {
-      socketService.emitToSocket(socketId, 'debug_model_payload', {
-        url,
-        model,
-        stream,
-        totalMessages: messages.length,
-        messagesPreview: messages.slice(0, 6).map(m => ({ role: m.role, content: safeTruncate(m.content, 500) }))
-      });
-    } catch (e) {
-      console.warn('[DEBUG] emit debug_model_payload failed:', e.message);
+      console.warn('[DEBUG][ia.service] log failed:', e.message);
     }
   }
 
@@ -71,14 +83,15 @@ const chatWithOllama = async ({ mensajes, stream = false, socketId = null, timeo
     clearTimeout(timeout);
 
     if (!res.ok) {
-      const errorText = await res.text();
-      throw new Error(`Ollama error: ${res.status} - ${errorText}`);
+      const text = await res.text();
+      throw new Error(`Ollama error: ${res.status} - ${text}`);
     }
 
     if (!stream) {
       const json = await res.json();
-      return { content: json.message?.content || '', raw: json };
+      return { content: json.message?.content || '', raw: json, model: usedModel };
     } else {
+      // streaming
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let fullContent = '';
@@ -87,34 +100,30 @@ const chatWithOllama = async ({ mensajes, stream = false, socketId = null, timeo
         const { done, value } = await reader.read();
         if (done) break;
         const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n').filter(line => line.trim());
+        const lines = chunk.split('\n').filter(l => l.trim());
 
         for (const line of lines) {
           try {
             const json = JSON.parse(line);
             const content = json.message?.content || '';
-
             if (content) {
               fullContent += content;
-              if (socketId) {
-                socketService.emitToSocket(socketId, 'chat_stream', { chunk: content, done: json.done || false });
-              }
+              if (socketId) socketService.emitToSocket(socketId, 'chat_stream', { chunk: content, done: json.done || false, model: usedModel });
             }
           } catch (e) {
-            // fallback raw chunk
             fullContent += line;
-            if (socketId) {
-              socketService.emitToSocket(socketId, 'chat_stream', { chunk: line, done: false });
-            }
+            if (socketId) socketService.emitToSocket(socketId, 'chat_stream', { chunk: line, done: false, model: usedModel });
           }
         }
       }
 
-      return { content: fullContent, raw: null };
+      return { content: fullContent, raw: null, model: usedModel };
     }
-  } catch (error) {
+  } catch (err) {
     clearTimeout(timeout);
-    throw error;
+    throw err;
+  } finally {
+    currentCalls = Math.max(0, currentCalls - 1);
   }
 };
 

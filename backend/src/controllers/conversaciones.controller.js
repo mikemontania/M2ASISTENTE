@@ -1,17 +1,16 @@
-// reemplaza tu archivo actual por este (añadí debug controlado por DEBUG_CHAT)
+// controllers/conversaciones.controller.js
 const Conversacion = require('../models/conversacion.model');
 const Mensaje = require('../models/mensaje.model');
 const ArchivoAdjunto = require('../models/archivoAdjunto.model');
 const { chatWithOllama } = require('../services/ia.service');
+const { chooseModelForMessages, executeWorkflow } = require('../services/modelOrchestrator.service');
 const socketService = require('../services/socket.service');
 const fs = require('fs');
 const path = require('path');
 const { UPLOADS_DIR } = require('../services/uploads.service');
 
- 
-
-const MAX_CHARS_PER_FILE = 15000; // ajustar según tus pruebas
-const MAX_FILES_TO_ATTACH = 5;
+const MAX_CHARS_PER_FILE = 15000;
+const MAX_FILES_TO_ATTACH = 25;
 const DEBUG_TRUNCATE = 8000;
 
 const truncate = (s, n = DEBUG_TRUNCATE) => {
@@ -71,62 +70,43 @@ const agregarMensaje = async (req, res, next) => {
 
     const rolNormalizado = normalizarRol(rol);
 
-    // ------------------------------------------------------
+// ------------------------------------------------------
     // 1) Verificar existencia previa de cada archivo adjunto
     // ------------------------------------------------------
     for (const item of archivosAdjuntos || []) {
       let id = typeof item === "object" ? item.id : item;
-
       if (!id) continue;
-
       const existe = await ArchivoAdjunto.findByPk(id);
       if (!existe) {
-        return res.status(409).json({
-          error: "Archivo adjunto aún no está listo. Reintentar.",
-          archivoId: id,
-        });
+        return res.status(409).json({ error: "Archivo adjunto aún no está listo. Reintentar.", archivoId: id });
       }
     }
 
-    // ------------------------------------------------------
     // 2) Historial anterior (30 mensajes más recientes)
-    // ------------------------------------------------------
     let mensajesAnteriores = await Mensaje.findAll({
       where: { conversacionId },
       order: [["marcaDeTiempo", "DESC"]],
       limit: 30,
     });
+    mensajesAnteriores = mensajesAnteriores.reverse();
+    const mensajesFormateados = mensajesAnteriores.map((m) => ({ rol: m.rol, contenido: m.contenido }));
 
-    mensajesAnteriores = mensajesAnteriores.reverse(); // orden correcto
-
-    const mensajesFormateados = mensajesAnteriores.map((m) => ({
-      rol: m.rol,
-      contenido: m.contenido,
-    }));
-
-    // ------------------------------------------------------
     // 3) Resolver adjuntos (evitar duplicados y crear si falta)
-    // ------------------------------------------------------
     const adj = Array.isArray(archivosAdjuntos) ? archivosAdjuntos : [];
     const ids = new Set();
     const resolvedAdjuntos = [];
 
     for (const item of adj) {
       if (!item) continue;
-
       let found = null;
-
       if (typeof item === "number" || typeof item === "string") {
         found = await ArchivoAdjunto.findByPk(item);
       } else if (item.id) {
         found = await ArchivoAdjunto.findByPk(item.id);
       } else if (item.rutaArchivo) {
-        found = await ArchivoAdjunto.findOne({
-          where: { rutaArchivo: item.rutaArchivo },
-        });
+        found = await ArchivoAdjunto.findOne({ where: { rutaArchivo: item.rutaArchivo } });
       }
 
-      // Si ya existe y no está duplicado
       if (found) {
         if (!ids.has(found.id)) {
           ids.add(found.id);
@@ -135,31 +115,23 @@ const agregarMensaje = async (req, res, next) => {
         continue;
       }
 
-      // Crear si es un archivo nuevo
       if (!found && (item.rutaArchivo || item.nombreArchivo)) {
         const creado = await ArchivoAdjunto.create({
           conversacionId,
-          nombreArchivo:
-            item.nombreArchivo ||
-            path.basename(item.rutaArchivo || "archivo"),
+          nombreArchivo: item.nombreArchivo || path.basename(item.rutaArchivo || "archivo"),
           rutaArchivo: item.rutaArchivo || "",
           mimeType: item.mimeType || null,
           contenidoExtraido: item.contenidoExtraido || null,
         });
-
         ids.add(creado.id);
         resolvedAdjuntos.push(creado);
       }
     }
 
-    // ------------------------------------------------------
-    // 4) Crear mensajes del sistema con contenido de adjuntos
-    // ------------------------------------------------------
+    // 4) Mensajes con contenido de adjuntos
     const attachmentMessages = [];
-
     for (const a of resolvedAdjuntos.slice(0, MAX_FILES_TO_ATTACH)) {
       let textContent = null;
-
       if (a.contenidoExtraido) {
         textContent = a.contenidoExtraido;
       } else if (a.rutaArchivo) {
@@ -172,95 +144,68 @@ const agregarMensaje = async (req, res, next) => {
         textContent = `[Adjunto sin contenido: ${a.nombreArchivo}]`;
       }
 
-      const snippet =
-        textContent.length > MAX_CHARS_PER_FILE
-          ? textContent.slice(0, MAX_CHARS_PER_FILE) +
-            "\n...[TRUNCADO POR LARGO]..."
-          : textContent;
+      const snippet = textContent.length > MAX_CHARS_PER_FILE
+        ? textContent.slice(0, MAX_CHARS_PER_FILE) + "\n...[TRUNCADO POR LARGO]..."
+        : textContent;
 
-      attachmentMessages.push({
-        rol: "system",
-        contenido: `Archivo adjunto: ${a.nombreArchivo}\n\n${snippet}`,
-      });
+      attachmentMessages.push({ rol: "system", contenido: `Archivo adjunto: ${a.nombreArchivo}\n\n${snippet}` });
     }
 
-    // ------------------------------------------------------
-    // 5) Construir el prompt final para la IA
-    // ------------------------------------------------------
-    const finalMessagesForModel = [
-      ...attachmentMessages,
-      ...mensajesFormateados,
-      { rol: rolNormalizado, contenido },
-    ];
+    // 5) Construir prompt final
+    const finalMessagesForModel = [...attachmentMessages, ...mensajesFormateados, { rol: rolNormalizado, contenido }];
 
-    // ------------------------------------------------------
-    // 6) Guardar mensaje del usuario (adjuntos como IDs)
-    // ------------------------------------------------------
+    // 6) Guardar mensaje del usuario
     const adjFinal = resolvedAdjuntos.map((a) => a.id);
-
     const mensajeUsuario = await Mensaje.create({
       conversacionId,
       rol: rolNormalizado,
       contenido,
-      archivosAdjuntos: adjFinal,
+      archivosAdjuntos: adjFinal
     });
 
-    // ------------------------------------------------------
-    // 7) STREAMING VIA SOCKET
-    // ------------------------------------------------------
+    // 7) STREAMING via socket (mantener tu comportamiento actual)
     const useStream = stream === "true" || stream === true;
-
     if (useStream && socketId) {
-      res.json({
-        ok: true,
-        mensajeUsuario,
-        streaming: true,
-      });
+      res.json({ ok: true, mensajeUsuario, streaming: true });
 
-      chatWithOllama({
-        mensajes: finalMessagesForModel,
-        stream: true,
-        socketId,
-      })
+      // usamos chatWithOllama en streaming tal como antes; esto no se orquesta
+      chatWithOllama({ mensajes: finalMessagesForModel, stream: true, socketId })
         .then(async (resp) => {
-          const mensajeIA = await Mensaje.create({
-            conversacionId,
-            rol: "asistente",
-            contenido: resp.content,
-          });
-
-          socketService.emitToSocket(socketId, "mensaje_completado", {
-            mensaje: mensajeIA,
-          });
+          const mensajeIA = await Mensaje.create({ conversacionId, rol: "asistente", contenido: resp.content });
+          socketService.emitToSocket(socketId, "mensaje_completado", { mensaje: mensajeIA });
         })
         .catch((err) => {
-          socketService.emitToSocket(socketId, "error_chat", {
-            error: err.message,
-          });
+          socketService.emitToSocket(socketId, "error_chat", { error: err.message });
         });
 
       return;
     }
 
-    // ------------------------------------------------------
-    // 8) MODO NORMAL (RESPUESTA COMPLETA)
-    // ------------------------------------------------------
-    const resp = await chatWithOllama({
-      mensajes: finalMessagesForModel,
-      stream: false,
-    });
+    // 8) MODO NORMAL (RESPUESTA COMPLETA) -> usar orquestador, guardar metadata y modelResponses
+    const plan = await chooseModelForMessages(finalMessagesForModel);
+    let chosenModel = (plan && (plan.selectedModel || plan.model)) ? (plan.selectedModel || plan.model) : process.env.OLLAMA_MODEL || 'qwen2.5:7b';
+
+    // Ejecutar workflow y obtener todas las respuestas
+    const execResult = await executeWorkflow({ mensajes: finalMessagesForModel, plan, socketId });
 
     const mensajeIA = await Mensaje.create({
       conversacionId,
       rol: "asistente",
-      contenido: resp.content,
+      contenido: execResult.finalOutput,
+      metadata: { chosenModel, planner: plan || null, timestamp: new Date() },
+      modelResponses: execResult.results.map(r => ({
+        step: r.step,
+        model: r.model,
+        raw: r.response.raw || null,
+        contentPreview: (r.response.content || '').slice(0, 2000)
+      }))
     });
 
-    res.json({
-      ok: true,
-      mensajeUsuario,
-      mensajeIA,
-    });
+    if (socketId) {
+      try { socketService.emitToSocket(socketId, 'mensaje_completado', { mensaje: mensajeIA }); } catch (e) {}
+    }
+
+    res.json({ ok: true, mensajeUsuario, mensajeIA, orchestration: { plan, resultsCount: execResult.results.length } });
   } catch (err) {
     next(err);
   }
