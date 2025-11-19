@@ -1,19 +1,100 @@
 // services/modelOrchestrator.service.js
-// OPTIMIZADO: Usa TODOS los modelos instalados + cache + métricas + paralelización
+// ORQUESTADOR INTELIGENTE (Multi-pass adaptativo) v2
+// Reemplaza completamente tu fichero anterior por este.
 
 const { chatWithOllama } = require('./ia.service');
 const socketService = require('./socket.service');
 const crypto = require('crypto');
 
 // ============================================
-// CACHE EN MEMORIA (para respuestas repetidas)
+// CAPACIDADES DE MODELOS (CRÍTICO)
+// ============================================
+const MODEL_CAPABILITIES = {
+  'phi4:latest': {
+    timeout: 30000,
+    purpose: 'planning',
+    maxTokens: 512,
+    supportsImages: false,
+    supportsCode: true,
+    supportsReasoning: true,
+    speed: 'fast'
+  },
+  'llama3.2:latest': {
+    timeout: 45000,
+    purpose: 'fast-general',
+    maxTokens: 2048,
+    supportsImages: false,
+    supportsCode: true,
+    supportsReasoning: true,
+    speed: 'fast'
+  },
+  'qwen2.5:7b': {
+    timeout: 90000,
+    purpose: 'general',
+    maxTokens: 4096,
+    supportsImages: false,
+    supportsCode: true,
+    supportsReasoning: true,
+    speed: 'medium'
+  },
+  'qwen2.5-coder:7b': {
+    timeout: 120000,
+    purpose: 'code-generation',
+    maxTokens: 8192,
+    supportsImages: false,
+    supportsCode: true,
+    supportsReasoning: true,
+    speed: 'medium'
+  },
+  'deepseek-coder:6.7b': {
+    timeout: 100000,
+    purpose: 'code-optimization',
+    maxTokens: 8192,
+    supportsImages: false,
+    supportsCode: true,
+    supportsReasoning: true,
+    speed: 'medium'
+  },
+  'deepseek-r1:7b': {
+    timeout: 150000,
+    purpose: 'reasoning-verification',
+    maxTokens: 4096,
+    supportsImages: false,
+    supportsCode: true,
+    supportsReasoning: true,
+    speed: 'slow'
+  },
+  'llava:7b': {
+    timeout: 120000,
+    purpose: 'vision',
+    maxTokens: 2048,
+    supportsImages: true,
+    supportsCode: false,
+    supportsReasoning: false,
+    speed: 'medium'
+  },
+  'bge-large:latest': {
+    timeout: 20000,
+    purpose: 'embeddings',
+    maxTokens: 512,
+    supportsImages: false,
+    supportsCode: false,
+    supportsReasoning: false,
+    speed: 'fast'
+  }
+};
+
+const MODEL_CONFIG = MODEL_CAPABILITIES;
+
+// ============================================
+// CACHE
 // ============================================
 const responseCache = new Map();
-const CACHE_TTL = 3600000; // 1 hora en ms
+const CACHE_TTL = 3600000;
 const MAX_CACHE_SIZE = 100;
 
 const getCacheKey = (mensajes, model) => {
-  const content = JSON.stringify(mensajes.slice(-3)) + model; // últimos 3 mensajes
+  const content = JSON.stringify(mensajes.slice(-4)) + model;
   return crypto.createHash('md5').update(content).digest('hex');
 };
 
@@ -36,448 +117,456 @@ const setCache = (key, data) => {
 };
 
 // ============================================
-// CONFIGURACIÓN DE MODELOS
+// VALIDACIÓN DE CAPACIDADES
 // ============================================
-const MODEL_CONFIG = {
-  'phi4:latest': { 
-    timeout: 30000, 
-    purpose: 'planning',
-    maxTokens: 512 
-  },
-  'llama3.2:latest': { 
-    timeout: 45000, 
-    purpose: 'fast-general',
-    maxTokens: 2048 
-  },
-  'qwen2.5:7b': { 
-    timeout: 90000, 
-    purpose: 'general',
-    maxTokens: 4096 
-  },
-  'qwen2.5-coder:7b': { 
-    timeout: 120000, 
-    purpose: 'code-generation',
-    maxTokens: 8192 
-  },
-  'deepseek-coder:6.7b': { 
-    timeout: 100000, 
-    purpose: 'code-optimization',
-    maxTokens: 8192 
-  },
-  'deepseek-r1:7b': { 
-    timeout: 150000, 
-    purpose: 'reasoning-verification',
-    maxTokens: 4096 
-  },
-  'llava:7b': { 
-    timeout: 90000, 
-    purpose: 'vision',
-    maxTokens: 2048 
-  },
-  'bge-large:latest': { 
-    timeout: 20000, 
-    purpose: 'embeddings',
-    maxTokens: 512 
+const validateModelCapabilities = (model, requirements) => {
+  const capabilities = MODEL_CAPABILITIES[model];
+  if (!capabilities) {
+    console.warn(`[VALIDATION] Modelo desconocido: ${model}`);
+    return false;
   }
+
+  const issues = [];
+  if (requirements.needsImages && !capabilities.supportsImages) issues.push('no soporta imágenes');
+  if (requirements.needsCode && !capabilities.supportsCode) issues.push('no soporta generación de código');
+  if (requirements.needsReasoning && !capabilities.supportsReasoning) issues.push('no soporta razonamiento profundo');
+
+  if (issues.length > 0) {
+    console.warn(`[VALIDATION] ${model} tiene limitaciones: ${issues.join(', ')}`);
+    return false;
+  }
+
+  return true;
 };
 
 // ============================================
-// HEURÍSTICO MEJORADO (usa conteo de patrones)
+// HEURÍSTICAS Y DETECTORES UTILES
 // ============================================
-const heuristicChoose = (mensajes) => {
-  const lastMsg = mensajes.slice(-1)[0]?.contenido || '';
+const shouldRunCoderAfterVision = (text) => {
+  if (!text) return false;
+  return /\b(function|const|async|class|import|export|return|if|else|for|while|def|var|let|```|json|script)\b/i.test(text)
+    || /\b(tabla|columna|fila|csv|excel|valores|dataframe)\b/i.test(text);
+};
+
+const shouldRunReasoningAfterVision = (text) => {
+  if (!text) return false;
+  return /\b(analiza|explica|por qué|deduce|compara|evalúa|concluye|razon)\b/i.test(text);
+};
+
+const visionSaysAmbiguous = (text) => {
+  if (!text) return false;
+  return /\b(no estoy seguro|no puedo ver bien|poca resolución|imposible determinar|no es claro|no puedo leer)\b/i.test(text);
+};
+
+const visionContainsTableLike = (text) => {
+  if (!text) return false;
+  return /\b(col|fila|tabla||nro|cantidad|total|subtotal|precio|cantidad)\b/i.test(text) && /[:;\|\t]/.test(text);
+};
+
+// ============================================
+// ANALISIS DE REQUERIMIENTOS (mejorado)
+// ============================================
+const analyzeRequirements = (mensajes) => {
+  const requirements = {
+    needsImages: false,
+    needsCode: false,
+    needsOptimization: false,
+    needsReasoning: false,
+    needsFastResponse: false
+  };
+
+  requirements.needsImages = mensajes.some(m => m.attachmentImages && m.attachmentImages.length > 0);
   const fullContext = mensajes.map(m => m.contenido).join(' ').toLowerCase();
-  
-  // Patrones de detección expandidos
+
   const patterns = {
-    code: /\b(function|const|async|class|import|export|return|if|else|for|while)\b/g,
-    backend: /\b(express|sequelize|database|sql|api|rest|endpoint|controller|service|model)\b/g,
-    frontend: /\b(react|vue|angular|component|jsx|tsx|css|html|dom|state)\b/g,
-    debug: /\b(error|bug|fix|stack|trace|exception|crash|fail)\b/g,
-    optimization: /\b(optimiz|performance|speed|cache|memory|eficien)\b/g,
-    visual: /\b(imagen|logo|svg|png|jpg|css|style|color|diseño)\b/g,
-    reasoning: /\b(analiza|razona|piensa|explica|por qué|compara|evalúa)\b/g,
-    summary: /\b(resumen|resumir|sumariza|sintetiza|extracto)\b/g,
-    refactor: /\b(refactor|reestructura|mejora|limpia|reorganiza)\b/g
+    code: /\b(function|const|async|class|import|export|return|if|else|for|while|def|var|let)\b/g,
+    optimization: /\b(optimiz|performance|speed|cache|memory|eficien|mejora|rápid)\b/g,
+    reasoning: /\b(analiza|razona|piensa|explica|por qué|compara|evalúa|considera|concluye)\b/g,
+    fastQuery: /\b(rápid|breve|corto|simple|hola|gracias|ok)\b/g
   };
-  
-  // Contar ocurrencias
-  const scores = {};
-  for (const [key, regex] of Object.entries(patterns)) {
-    const matches = fullContext.match(regex);
-    scores[key] = matches ? matches.length : 0;
-  }
-  
-  // Logging para debug
-  if (process.env.DEBUG_CHAT === 'true') {
-    console.log('[HEURISTIC] Scores:', scores);
-  }
-  
-  // Decisión por prioridad y puntaje
-  const maxScore = Math.max(...Object.values(scores));
-  
-  // CASO 1: Optimización de código existente
-  if (scores.optimization >= 2 || (scores.code > 3 && scores.optimization > 0)) {
-    return {
-      selectedModel: 'deepseek-coder:6.7b',
-      reason: 'code-optimization',
-      workflow: ['coder', 'verifier'],
-      verifierModel: 'qwen2.5-coder:7b'
-    };
-  }
-  
-  // CASO 2: Razonamiento profundo
-  if (scores.reasoning === maxScore && scores.reasoning >= 2) {
-    return {
-      selectedModel: 'deepseek-r1:7b',
-      reason: 'deep-reasoning',
-      workflow: ['coder']
-    };
-  }
-  
-  // CASO 3: Backend complejo
-  if (scores.backend >= 2 || (scores.code > 2 && scores.backend > 0)) {
-    return {
-      selectedModel: 'qwen2.5-coder:7b',
-      reason: 'backend-development',
-      workflow: ['coder', 'verifier'],
-      verifierModel: 'deepseek-r1:7b'
-    };
-  }
-  
-  // CASO 4: Frontend
-  if (scores.frontend >= 2) {
-    return {
-      selectedModel: 'qwen2.5-coder:7b',
-      reason: 'frontend-development',
-      workflow: ['coder']
-    };
-  }
-  
-  // CASO 5: Debug/fixing
-  if (scores.debug === maxScore && scores.debug >= 2) {
-    return {
-      selectedModel: 'deepseek-coder:6.7b',
-      reason: 'debugging',
-      workflow: ['coder', 'verifier'],
-      verifierModel: 'deepseek-r1:7b'
-    };
-  }
-  
-  // CASO 6: Refactoring
-  if (scores.refactor >= 2) {
-    return {
-      selectedModel: 'deepseek-coder:6.7b',
-      reason: 'refactoring',
-      workflow: ['coder', 'verifier'],
-      verifierModel: 'qwen2.5-coder:7b'
-    };
-  }
-  
-  // CASO 7: Contenido visual
-  if (scores.visual === maxScore && scores.visual >= 1) {
-    return {
-      selectedModel: 'llava:7b',
-      reason: 'visual-content',
-      workflow: ['coder']
-    };
-  }
-  
-  // CASO 8: Resumen
-  if (scores.summary >= 2) {
-    return {
-      selectedModel: 'llama3.2:latest',
-      reason: 'summarization',
-      workflow: ['coder']
-    };
-  }
-  
-  // CASO 9: Código general
-  if (scores.code >= 3) {
-    return {
-      selectedModel: 'qwen2.5-coder:7b',
-      reason: 'general-coding',
-      workflow: ['coder']
-    };
-  }
-  
-  // CASO 10: Default rápido para conversación general
-  return {
-    selectedModel: 'llama3.2:latest',
-    reason: 'fast-general',
-    workflow: ['coder']
-  };
+
+  const codeMatches = (fullContext.match(patterns.code) || []).length;
+  const optimizationMatches = (fullContext.match(patterns.optimization) || []).length;
+  const reasoningMatches = (fullContext.match(patterns.reasoning) || []).length;
+  const fastMatches = (fullContext.match(patterns.fastQuery) || []).length;
+
+  requirements.needsCode = codeMatches >= 2;
+  requirements.needsOptimization = optimizationMatches >= 1;
+  requirements.needsReasoning = reasoningMatches >= 1;
+  requirements.needsFastResponse = fastMatches >= 1 && fullContext.length < 200;
+
+  console.log('[REQUIREMENTS] Análisis:', {
+    needsImages: requirements.needsImages,
+    needsCode: requirements.needsCode,
+    needsOptimization: requirements.needsOptimization,
+    needsReasoning: requirements.needsReasoning,
+    codeMatches,
+    optimizationMatches,
+    reasoningMatches
+  });
+
+  return requirements;
 };
 
 // ============================================
-// PLANNER CON CACHE
+// SELECTOR (mejorado)
 // ============================================
-const chooseModelForMessages = async (mensajes) => {
-  const last = mensajes.slice(-1)[0];
-  const cacheKey = getCacheKey(mensajes, 'planner');
-  
-  // Intentar cache primero
-  const cached = getCached(cacheKey);
-  if (cached) {
-    console.log('[PLANNER] Cache hit!');
-    return cached;
+const findBestModelForRequirements = (requirements) => {
+  // Si necesita imágenes, el flujo incluirá visión primero, pero el "bestModel" se usa como coder inicial si corresponde.
+  if (requirements.needsImages) {
+    return 'llava:7b';
   }
-  
-  // Prompt mejorado para phi4
-  const prompt = [
-    { 
-      rol: 'system', 
-      contenido: `Eres un planner experto. Analiza el contexto y responde SOLO un JSON válido.
 
-Modelos disponibles:
-- llama3.2:latest (rápido, conversación general)
-- qwen2.5:7b (general, balanceado)
-- qwen2.5-coder:7b (código backend/frontend)
-- deepseek-coder:6.7b (optimización de código)
-- deepseek-r1:7b (razonamiento profundo)
-- llava:7b (contenido visual)
+  if (requirements.needsOptimization && requirements.needsCode) return 'deepseek-coder:6.7b';
+  if (requirements.needsReasoning && !requirements.needsCode) return 'deepseek-r1:7b';
+  if (requirements.needsCode) return 'qwen2.5-coder:7b';
+  if (requirements.needsFastResponse) return 'llama3.2:latest';
+  return 'qwen2.5:7b';
+};
 
-Workflows disponibles: ["coder"], ["coder","verifier"], ["parallel-verify"]
+// ============================================
+// EJECUTOR CON RETRY Y FALLBACK (igual que antes, con pequeño ajuste)
+// ============================================
+const executeWithRetry = async (mensajes, model, socketId, hasImages, maxRetries = 2) => {
+  const capabilities = MODEL_CAPABILITIES[model];
 
-Formato JSON:
-{
-  "selectedModel": "modelo-elegido",
-  "reason": "explicación-breve",
-  "workflow": ["coder"] o ["coder","verifier"],
-  "verifierModel": "modelo-verificador" (opcional)
-}`
-    },
-    { 
-      rol: 'user', 
-      contenido: `Mensaje a analizar:\n\n${last ? last.contenido : ''}\n\nTotal de mensajes en contexto: ${mensajes.length}` 
-    }
-  ];
-  
-  try {
-    const resp = await chatWithOllama({ 
-      mensajes: prompt, 
-      model: 'phi4:latest', 
-      stream: false, 
-      timeoutMs: MODEL_CONFIG['phi4:latest'].timeout 
-    });
-    
-    const txt = resp.content || '';
-    const jsonMatch = txt.match(/\{[\s\S]*?\}/);
-    
-    if (jsonMatch) {
-      try {
-        const parsed = JSON.parse(jsonMatch[0]);
-        if (parsed.selectedModel && MODEL_CONFIG[parsed.selectedModel]) {
-          setCache(cacheKey, parsed);
-          return parsed;
-        }
-      } catch (e) {
-        console.warn('[PLANNER] JSON parse error:', e.message);
+  if (hasImages && !capabilities?.supportsImages) {
+    console.warn(`[EXECUTOR] ${model} NO soporta imágenes, cambiando a llava:7b`);
+    model = 'llava:7b';
+  }
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[EXECUTOR] Intento ${attempt}/${maxRetries} con ${model}`);
+      const response = await chatWithOllama({
+        mensajes,
+        model,
+        stream: false,
+        socketId,
+        timeoutMs: MODEL_CAPABILITIES[model]?.timeout || 90000,
+        hasImages
+      });
+
+      if (!response.content || response.content.trim().length === 0) throw new Error('Respuesta vacía del modelo');
+
+      // Detectar patrones de incapacidad ante imágenes
+      const errorPatterns = [
+        /no puedo ver.*imágenes/i,
+        /no tengo.*capacidad.*analizar imágenes/i,
+        /soy un modelo.*texto/i,
+        /cannot process images/i
+      ];
+
+      const hasErrorPattern = errorPatterns.some(pattern => pattern.test(response.content));
+      if (hasErrorPattern && hasImages && model !== 'llava:7b') {
+        console.warn(`[EXECUTOR] ${model} indica que no puede procesar imágenes; reintentando con llava:7b`);
+        model = 'llava:7b';
+        continue;
       }
+
+      return { response, model, attempt };
+    } catch (error) {
+      console.error(`[EXECUTOR] Error en intento ${attempt} con ${model}:`, error.message);
+      if (attempt === maxRetries) throw error;
+      if (hasImages && model !== 'llava:7b') {
+        console.log('[EXECUTOR] Fallback a llava:7b por error...');
+        model = 'llava:7b';
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
     }
-    
-    // Fallback a heurístico
-    const heuristic = heuristicChoose(mensajes);
-    setCache(cacheKey, heuristic);
-    return heuristic;
-    
-  } catch (e) {
-    console.warn('[PLANNER] Error, using heuristic:', e.message);
-    const heuristic = heuristicChoose(mensajes);
-    setCache(cacheKey, heuristic);
-    return heuristic;
   }
+
+  throw new Error('Todos los intentos fallaron');
 };
 
 // ============================================
-// WORKFLOW CON MÉTRICAS Y PARALELIZACIÓN
+// NUEVO: EJECUCIÓN ADAPTATIVA LUEGO DE VISIÓN
 // ============================================
-const executeWorkflow = async ({ mensajes, plan, socketId = null }) => {
+const runVisionThenAdaptive = async ({ mensajes, socketId, hasImages }) => {
+  // 1) Ejecutar llava con el prompt + imágenes (pasamos mensajes completos; ia.service maneja images)
+  const visionRespObj = await executeWithRetry(mensajes, 'llava:7b', socketId, true, 2);
+  const visionText = visionRespObj.response.content || '';
+  const results = [{
+    step: 'vision',
+    model: visionRespObj.model,
+    response: visionRespObj.response,
+    duration: 0,
+    attempts: visionRespObj.attempt
+  }];
+
+  // heurísticas sobre la salida de visión
+  const needsCoder = shouldRunCoderAfterVision(visionText);
+  const needsReasoning = shouldRunReasoningAfterVision(visionText);
+  const ambiguous = visionSaysAmbiguous(visionText) || visionContainsTableLike(visionText);
+
+  // Si ambiguous, generamos un prompt para clarificar/extracto de tabla
+  let combinedOutput = visionText;
+
+  // 2) Si visión sugiere que necesita estructuración/codigo -> llamar coder
+  if (needsCoder || ambiguous) {
+    // construir prompt para coder: incluir salida de visión y el último user message si existe
+    const coderPrompt = [
+      { rol: 'system', contenido: 'Eres un asistente especializado en generar código y transformar salidas de análisis visual en estructuras útiles (JSON, CSV, scripts, etc.).' },
+      { rol: 'user', contenido: `Salida del modelo de visión (analiza y transforma según la petición original):\n\n${visionText}\n\nTarea: si la salida contiene una tabla o datos, extraelos en formato JSON/CSV. Si el usuario pidió código, genera el script necesario. Si hace falta más contexto, intenta inferirlo y marca lo que falta.` }
+    ];
+
+    const coderRespObj = await executeWithRetry(coderPrompt, 'qwen2.5-coder:7b', socketId, false, 2);
+    combinedOutput = `${combinedOutput}\n\n--- CODER ---\n${coderRespObj.response.content || ''}`;
+    results.push({
+      step: 'coder',
+      model: coderRespObj.model,
+      response: coderRespObj.response,
+      duration: 0,
+      attempts: coderRespObj.attempt
+    });
+  }
+
+  // 3) Si necesita razonamiento/verificacion -> llamar verifier
+  if (needsReasoning) {
+    const verifyPrompt = [
+      { rol: 'system', contenido: 'Eres un verificador experto. Revisa la respuesta previa y corrige errores, completando la información faltante.' },
+      { rol: 'user', contenido: `Verifica esta salida (proveerás correcciones o dudas claras):\n\n${combinedOutput}` }
+    ];
+
+    const verifierModel = 'deepseek-r1:7b';
+    const verifyRespObj = await executeWithRetry(verifyPrompt, verifierModel, socketId, false, 2);
+    combinedOutput = `${combinedOutput}\n\n--- VERIFICACIÓN ---\n${verifyRespObj.response.content || ''}`;
+    results.push({
+      step: 'verifier',
+      model: verifyRespObj.model,
+      response: verifyRespObj.response,
+      duration: 0,
+      attempts: verifyRespObj.attempt
+    });
+  }
+
+  return { combinedOutput, results };
+};
+
+// ============================================
+// EJECUTAR WORKFLOW (mejorado y compatible)
+// ============================================
+const executeWorkflow = async ({ mensajes, plan, socketId = null, hasImages = false }) => {
   const startTime = Date.now();
   const results = [];
   let finalOutput = '';
-  
+
   const metrics = {
-    plannerTime: 0,
+    plannerTime: plan.plannerTime || 0,
     coderTime: 0,
     verifierTime: 0,
+    visionTime: 0,
     totalTime: 0,
     modelCalls: 0,
+    retries: 0,
     cacheHits: 0,
     tokensEstimated: 0
   };
-  
-  // Verificar cache de respuesta completa
-  const workflowCacheKey = getCacheKey(mensajes, plan.selectedModel + plan.workflow.join('-'));
+
+  hasImages = hasImages || !!plan.requirements?.needsImages;
+
+  // Cache guard: no cache for image flows (mantener seguridad)
+  const workflowCacheKey = getCacheKey(mensajes, plan.selectedModel + (plan.workflow||[]).join('-'));
   const cachedWorkflow = getCached(workflowCacheKey);
-  
-  if (cachedWorkflow) {
-    console.log('[WORKFLOW] Cache hit! Returning cached result');
+  if (cachedWorkflow && !hasImages) {
     metrics.cacheHits = 1;
     metrics.totalTime = Date.now() - startTime;
-    
-    if (socketId) {
-      socketService.emitToSocket(socketId, 'performance_metrics', { ...metrics, fromCache: true });
-    }
-    
+    if (socketId) socketService.emitToSocket(socketId, 'performance_metrics', { ...metrics, fromCache: true });
     return cachedWorkflow;
   }
-  
-  // WORKFLOW: PARALLEL VERIFY (coder + verifier en paralelo)
-  if (plan.workflow.includes('parallel-verify')) {
-    const parallelStart = Date.now();
-    
-    const [coderResp, verifierResp] = await Promise.all([
-      chatWithOllama({ 
-        mensajes, 
-        model: plan.selectedModel, 
-        stream: false, 
-        socketId,
-        timeoutMs: MODEL_CONFIG[plan.selectedModel]?.timeout 
-      }),
-      chatWithOllama({ 
-        mensajes: [
-          ...mensajes,
-          { rol: 'system', contenido: 'Actúa como verificador. Identifica posibles mejoras o errores.' }
-        ], 
-        model: plan.verifierModel || 'deepseek-r1:7b', 
-        stream: false,
-        timeoutMs: MODEL_CONFIG[plan.verifierModel || 'deepseek-r1:7b']?.timeout
-      })
-    ]);
-    
-    const parallelTime = Date.now() - parallelStart;
-    
-    results.push({ step: 'coder', model: plan.selectedModel, response: coderResp, duration: parallelTime });
-    results.push({ step: 'verifier-parallel', model: plan.verifierModel || 'deepseek-r1:7b', response: verifierResp, duration: parallelTime });
-    
-    finalOutput = `${coderResp.content}\n\n--- VERIFICACIÓN ---\n${verifierResp.content}`;
-    metrics.modelCalls = 2;
-    metrics.coderTime = parallelTime;
-    metrics.verifierTime = parallelTime;
-  }
-  // WORKFLOW: CODER + VERIFIER (secuencial)
-  else if (plan.workflow.includes('coder')) {
+
+  // Si el plan sugiere visión (o detectamos imágenes), usamos el flow vision->adaptive
+  if (hasImages) {
+    console.log('[WORKFLOW] Ejecutando flujo vision->adaptive');
+    const visionStart = Date.now();
+    const visionResult = await runVisionThenAdaptive({ mensajes, socketId, hasImages: true });
+    const visionDuration = Date.now() - visionStart;
+
+    // push results devueltos
+    visionResult.results.forEach(r => results.push({
+      step: r.step,
+      model: r.model,
+      response: r.response,
+      duration: r.duration || visionDuration,
+      attempts: r.attempts || 1
+    }));
+
+    finalOutput = visionResult.combinedOutput || '';
+    metrics.visionTime = visionDuration;
+    metrics.modelCalls += visionResult.results.length;
+  } else {
+    // Flow clásico: coder (selectedModel) -> verifier si aplica
     const coderStart = Date.now();
-    const coderModel = plan.coderModel || plan.selectedModel;
-    
-    const coderResp = await chatWithOllama({ 
-      mensajes, 
-      model: coderModel, 
-      stream: false, 
-      socketId,
-      timeoutMs: MODEL_CONFIG[coderModel]?.timeout 
-    });
-    
+    const coderModel = plan.selectedModel;
+    console.log('[WORKFLOW] Ejecutando coder clásico:', coderModel);
+
+    const { response: coderResp, model: finalCoderModel, attempt: coderAttempts } =
+      await executeWithRetry(mensajes, coderModel, socketId, false);
+
     const coderDuration = Date.now() - coderStart;
-    results.push({ step: 'coder', model: coderModel, response: coderResp, duration: coderDuration });
+    results.push({
+      step: 'coder',
+      model: finalCoderModel,
+      response: coderResp,
+      duration: coderDuration,
+      attempts: coderAttempts
+    });
+
     finalOutput = coderResp.content || '';
     metrics.coderTime = coderDuration;
     metrics.modelCalls++;
-    
-    // VERIFIER (si está en workflow)
-    if (plan.workflow.includes('verifier')) {
+    metrics.retries += (coderAttempts - 1);
+
+    if (plan.workflow.includes('verifier') && !hasImages) {
       const verifyStart = Date.now();
+      const verifierModel = plan.verifierModel || 'deepseek-r1:7b';
       const verifyPrompt = [
-        { 
-          rol: 'system', 
-          contenido: 'Eres un verificador experto. Analiza el código/respuesta y proporciona feedback constructivo. Si hay errores, sugiere correcciones específicas.' 
-        },
+        { rol: 'system', contenido: 'Eres un verificador experto. Analiza y proporciona feedback constructivo. Si encuentras errores, sugiere correcciones específicas.' },
         { rol: 'user', contenido: `Verifica lo siguiente:\n\n${finalOutput}` }
       ];
-      
-      const verifierModel = plan.verifierModel || 'deepseek-r1:7b';
-      const verifyResp = await chatWithOllama({ 
-        mensajes: verifyPrompt, 
-        model: verifierModel, 
-        stream: false, 
-        socketId,
-        timeoutMs: MODEL_CONFIG[verifierModel]?.timeout 
-      });
-      
+      const { response: verifyResp, attempt: verifyAttempts } =
+        await executeWithRetry(verifyPrompt, verifierModel, socketId, false);
+
       const verifyDuration = Date.now() - verifyStart;
-      results.push({ step: 'verifier', model: verifierModel, response: verifyResp, duration: verifyDuration });
+      results.push({
+        step: 'verifier',
+        model: verifierModel,
+        response: verifyResp,
+        duration: verifyDuration,
+        attempts: verifyAttempts
+      });
+
       finalOutput = `${finalOutput}\n\n--- VERIFICACIÓN ---\n${verifyResp.content || ''}`;
       metrics.verifierTime = verifyDuration;
       metrics.modelCalls++;
+      metrics.retries += (verifyAttempts - 1);
     }
   }
-  // FALLBACK: Single call
-  else {
-    const singleStart = Date.now();
-    const singleResp = await chatWithOllama({ 
-      mensajes, 
-      model: plan.selectedModel, 
-      stream: false, 
-      socketId,
-      timeoutMs: MODEL_CONFIG[plan.selectedModel]?.timeout 
-    });
-    
-    const singleDuration = Date.now() - singleStart;
-    results.push({ step: 'single', model: plan.selectedModel, response: singleResp, duration: singleDuration });
-    finalOutput = singleResp.content || '';
-    metrics.coderTime = singleDuration;
-    metrics.modelCalls = 1;
-  }
-  
+
   metrics.totalTime = Date.now() - startTime;
-  metrics.tokensEstimated = Math.floor(finalOutput.length / 4); // Aproximación
-  
-  const workflowResult = { finalOutput, results, plan, metrics };
-  
-  // Guardar en cache
-  setCache(workflowCacheKey, workflowResult);
-  
-  // Emitir métricas por socket
+  metrics.tokensEstimated = Math.floor((finalOutput || '').length / 4);
+
+  const workflowResult = {
+    finalOutput,
+    results,
+    plan,
+    metrics,
+    actualModelsUsed: results.map(r => r.model)
+  };
+
+  if (!hasImages) setCache(workflowCacheKey, workflowResult);
+
   if (socketId) {
     try {
       socketService.emitToSocket(socketId, 'performance_metrics', metrics);
-      
-      if (process.env.DEBUG_CHAT === 'true') {
-        socketService.emitToSocket(socketId, 'model_orch_results', {
-          plan,
-          results: results.map(r => ({ 
-            step: r.step, 
-            model: r.model, 
-            duration: r.duration,
-            contentPreview: (r.response.content || '').slice(0, 500) 
-          }))
-        });
-      }
+      socketService.emitToSocket(socketId, 'model_orch_results', {
+        plan,
+        actualModels: results.map(r => ({ step: r.step, model: r.model, attempts: r.attempts })),
+        results: results.map(r => ({
+          step: r.step,
+          model: r.model,
+          duration: r.duration,
+          attempts: r.attempts,
+          contentPreview: (r.response.content || '').slice(0, 500)
+        }))
+      });
     } catch (e) {
       console.warn('[WORKFLOW] Socket emit failed:', e.message);
     }
   }
-  
-  // Log de métricas
-  console.log('[WORKFLOW] Metrics:', {
+
+  console.log('[WORKFLOW] ✅ Completado:', {
     totalTime: `${metrics.totalTime}ms`,
     modelCalls: metrics.modelCalls,
-    avgTimePerCall: `${Math.round(metrics.totalTime / metrics.modelCalls)}ms`,
-    tokensEstimated: metrics.tokensEstimated
+    retries: metrics.retries,
+    modelsUsed: results.map(r => r.model).join(' → ')
   });
-  
+
   return workflowResult;
 };
 
 // ============================================
-// FUNCIÓN DE LIMPIEZA DE CACHE (llamar periódicamente)
+// PLANNER (mejorado, pero compatible con chooseModelForMessages previo)
+// ============================================
+const chooseModelForMessages = async (mensajes, hasImages = false) => {
+  const startTime = Date.now();
+
+  const requirements = analyzeRequirements(mensajes);
+  if (hasImages) requirements.needsImages = true;
+
+  // prioridad: si hay imágenes, el plan incluirá visión
+  if (requirements.needsImages) {
+    const plan = {
+      selectedModel: 'llava:7b',
+      reason: 'image-analysis-required',
+      workflow: ['vision', 'adaptive'],
+      verifierModel: requirements.needsCode ? 'qwen2.5-coder:7b' : 'deepseek-r1:7b',
+      requirements,
+      plannerTime: Date.now() - startTime
+    };
+    setCache(getCacheKey(mensajes, 'planner-v2'), plan);
+    return plan;
+  }
+
+  // si no hay imágenes, comportamiento clásico
+  const cacheKey = getCacheKey(mensajes, 'planner-v2');
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+
+  const bestModel = findBestModelForRequirements(requirements);
+  const isValid = validateModelCapabilities(bestModel, requirements);
+  if (!isValid) {
+    console.warn(`[PLANNER] Modelo ${bestModel} no cumple requisitos, buscando alternativa...`);
+    // fallback genérico
+    const fallback = {
+      selectedModel: 'qwen2.5:7b',
+      reason: 'fallback',
+      workflow: ['coder'],
+      verifierModel: 'deepseek-r1:7b',
+      requirements,
+      plannerTime: Date.now() - startTime
+    };
+    setCache(cacheKey, fallback);
+    return fallback;
+  }
+
+  let workflow = ['coder'];
+  let verifierModel = null;
+  if (requirements.needsOptimization || requirements.needsReasoning) {
+    workflow = ['coder', 'verifier'];
+    verifierModel = requirements.needsCode ? 'qwen2.5-coder:7b' : 'deepseek-r1:7b';
+  }
+
+  const plan = {
+    selectedModel: bestModel,
+    reason: 'requirements-based-selection',
+    workflow,
+    verifierModel,
+    requirements,
+    plannerTime: Date.now() - startTime
+  };
+
+  setCache(cacheKey, plan);
+  return plan;
+};
+
+// ============================================
+// LIMPIEZA
 // ============================================
 const clearExpiredCache = () => {
   const now = Date.now();
   for (const [key, value] of responseCache.entries()) {
-    if (now - value.timestamp > CACHE_TTL) {
-      responseCache.delete(key);
-    }
+    if (now - value.timestamp > CACHE_TTL) responseCache.delete(key);
   }
 };
-
-// Limpiar cache cada 10 minutos
 setInterval(clearExpiredCache, 600000);
 
-module.exports = { 
-  chooseModelForMessages, 
+module.exports = {
+  chooseModelForMessages,
   executeWorkflow,
   clearExpiredCache,
-  MODEL_CONFIG 
+  MODEL_CONFIG,
+  MODEL_CAPABILITIES,
+  validateModelCapabilities,
+  findBestModelForRequirements
 };
